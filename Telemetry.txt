@@ -1,0 +1,205 @@
+in Startup file
+
+public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory)
+.
+.
+// Add custom telemetry in ASP Web app
+var appService = app.ApplicationServices.GetService<IHttpContextAccessor>();
+if (appService != null)
+{
+	var telemetryInit = new TelemetryInitializer(appService);		<==this class is defined below
+	var telemetryConf = app.ApplicationServices.GetService<TelemetryConfiguration>();
+	if (telemetryConf != null)
+	{
+		telemetryConf.TelemetryInitializers.Add(telemetryInit);
+	}
+}
+
+public void ConfigureServices(IServiceCollection services)
+.
+.
+	var mvcServices = services.AddMvc(config =>
+	{
+	.
+	.
+		config.Filters.Add(new HandleErrorFilter());    <==this class defined below
+	});
+
+===========
+to create a generic exception filter (like a handler) this one goes in the helpers folder
+public class HandleErrorFilter : IAsyncExceptionFilter
+	{
+		private readonly TelemetryClient _telemetryClient;
+
+		public HandleErrorFilter()
+		{
+			_telemetryClient = new TelemetryClient();
+		}
+
+		public Task OnExceptionAsync(ExceptionContext context)
+		{
+			if (context != null &&
+			    context.HttpContext != null &&
+			    context.Exception != null)
+			{
+				_telemetryClient.TrackException(context.Exception);
+
+                // always return 500 status code 
+                context.Result = new WebExceptionRequestResult(context.Exception.Message);
+            }
+
+			return Task.FromResult(true);
+		}
+	}
+}
+==========
+To initialize the telemetry. This one also goes under helpers
+public class TelemetryInitializer : ITelemetryInitializer
+{
+	private readonly IHttpContextAccessor _httpContextAccessor;
+
+	public TelemetryInitializer(IHttpContextAccessor httpContextAccessor)
+	{
+		if (httpContextAccessor == null)
+			throw new System.ArgumentNullException(nameof(httpContextAccessor));
+		_httpContextAccessor = httpContextAccessor;
+	}
+
+	public void Initialize(ITelemetry telemetry)
+	{
+		OverwriteComponentVersion(telemetry);
+		AddPspHttpHeaders(telemetry);
+	}
+
+	private void OverwriteComponentVersion(ITelemetry telemetry)
+	{
+		var templateVersion = TemplateVersion.GetTemplateVersion().ToString();
+		telemetry.Context.Component.Version = templateVersion;
+	}
+
+	private void AddPspHttpHeaders(ITelemetry telemetry)
+	{
+		var context = _httpContextAccessor.HttpContext;
+		if (context == null) return;
+
+		foreach (var headerName in context.Request.Headers.Keys)
+		{
+			if (!headerName.StartsWith("PSP-")) continue;
+
+			var header = context.Request.Headers[headerName];
+			var headerValue = header.FirstOrDefault();
+
+			var headerKey = $"Request-{headerName}";
+			if (headerValue != null && !telemetry.Context.Properties.ContainsKey(headerKey))
+			{
+				var telemetryValue = $"{headerKey}:{headerValue}";
+				telemetry.Context.Properties.Add(headerKey, telemetryValue);
+			}
+		}
+	}
+}
+=====================
+in any class
+.
+.
+var telemetry = new TelemetryClient();
+.
+.
+telemetry.TrackEvent("performance-search-emails", new Dictionary<string, string>
+{
+	{ "duration-global", watchGlobal.ElapsedMilliseconds.ToString() },
+	{ "duration-sql", watchSql.ElapsedMilliseconds.ToString() },
+});
+.
+.
+telemetry.TrackException("type", Exception);  <==something like this
+
+
+
+
+
+
+====================
+or another way like this
+
+In Startup file
+
+public IConfiguration Configuration { get; }
+
+public Startup(IHostingEnvironment env)
+.
+.
+
+
+            var builder = new ConfigurationBuilder()
+                .SetBasePath(env.ContentRootPath)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true)
+                .AddEnvironmentVariables();
+
+#if !DEBUG
+            var baseConfig = builder.Build();
+            var kvName = baseConfig["VaultName"];
+
+            var kvBaseUrl = $"https://{kvName}.vault.azure.net/";
+
+            var tokenProvider = new AzureServiceTokenProvider();
+            var kvClient = new KeyVaultClient((authority, resource, scope) => tokenProvider.KeyVaultTokenCallback(authority, resource, scope));
+            var kvSecretManager = new DefaultKeyVaultSecretManager();
+
+            builder.AddAzureKeyVault(kvBaseUrl, kvClient, kvSecretManager);
+#endif
+
+ Configuration = builder.Build();
+.
+.
+ 
+// This method gets called by the runtime. Use this method to add services to the container.
+public void ConfigureServices(IServiceCollection services)
+{
+	services.AddApplicationInsightsTelemetry(Configuration);
+
+	// Angular's default header name for sending the XSRF token.
+	services.AddAntiforgery(options => options.HeaderName = "X-XSRF-TOKEN");
+
+	services.Configure<FormOptions>(opt => opt.MultipartBodyLengthLimit = 4294967295);
+
+	var mvcServices = services.AddMvc(options => options.Filters.Add(new AppInsightsHandleErrorFilter()));
+
+	ConfigureJsonService(mvcServices);
+
+	ConfigureOktaService(services);
+}
+
+=====================================================================
+in BaseController
+ 
+protected readonly TelemetryClient telemetry;
+
+public BaseController(IHttpContextAccessor contextAccessor)
+{
+.
+.
+	this.telemetry = new TelemetryClient();
+}
+		
+public TelemetryClient Telemetry
+{
+	get { return telemetry; }
+}
+
+protected void TrackException(Exception ex, Dictionary<string, double> metrics = null)
+{
+	telemetry.TrackException(ex, null, metrics);
+}
+
+=======================
+in a Controller that inherits from BaseController
+
+.
+.
+catch (Exception exc)
+{
+	TrackException(exc);
+	return BadRequest(exc.Message);
+}
